@@ -66,6 +66,9 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
+// Legacy: bound main-loop idle wait so cross-thread work drains steadily.
+// Unbounded SDL_WaitEvent() stalls RunOnMainThread() dispatch when idle.
+constexpr int              MAIN_LOOP_IDLE_TIMEOUT_MS = 4;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -414,8 +417,11 @@ bool HostInputWaitEvent(SDL_Event* event) {
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
-		has_event = SDL_WaitEvent(event);
-		if (!has_event) {
+		// Legacy: bounded wait so WindowContext::Run() drains main-thread tasks
+		// at a steady cadence even with no input activity.
+		SDL_ClearError();
+		has_event = SDL_WaitEventTimeout(event, MAIN_LOOP_IDLE_TIMEOUT_MS) != 0;
+		if (!has_event && SDL_GetError()[0] != '\0') {
 			EXIT("%s\n", SDL_GetError());
 		}
 	} else {

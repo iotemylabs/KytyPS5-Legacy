@@ -205,7 +205,7 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 }
 
 void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixel,
-                        ShaderInfo& info) {
+                        ShaderInfo& info, bool barycentric_supported) {
 	if (pixel->HasPositionInput()) {
 		AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
 	}
@@ -239,8 +239,12 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 		}
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		// Legacy: without barycentric support there is no PerVertexKHR varying.
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
-		         per_vertex[input]);
+		         barycentric_supported && per_vertex[input]);
+	}
+	if (!barycentric_supported) {
+		return;
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		if (interpolated[input] && per_vertex[input]) {
@@ -268,7 +272,8 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 	}
 }
 
-void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
+void CollectBuiltinInputs(const Program& program, ShaderInfo& info,
+                            bool barycentric_supported) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (program.stage == ShaderType::TessellationControl &&
@@ -301,10 +306,14 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 				case StageInputKind::BaryCoordSmooth:
 				case StageInputKind::BaryCoordSmoothCentroid:
-					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+					if (barycentric_supported) {
+						AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+					}
 					break;
 				case StageInputKind::BaryCoordNoPerspective:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+					if (barycentric_supported) {
+						AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+					}
 					break;
 				case StageInputKind::WorkgroupId:
 					AddInput(info, kind, 0, 3, "gl_WorkGroupID");
@@ -396,7 +405,8 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 
 } // namespace
 
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
+void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info,
+                       bool barycentric_supported) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
 		                                                : "shader info already collected");
@@ -419,11 +429,13 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::TessellationControl:
 		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh: break;
-		case ShaderType::Pixel: CollectPixelInputs(program, input_info.pixel, next); break;
+		case ShaderType::Pixel:
+			CollectPixelInputs(program, input_info.pixel, next, barycentric_supported);
+			break;
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, next); break;
 		default: return Fail("unsupported shader stage for info collection");
 	}
-	CollectBuiltinInputs(program, next);
+	CollectBuiltinInputs(program, next, barycentric_supported);
 	CollectOutputs(program, input_info, next);
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;

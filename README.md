@@ -1,4 +1,34 @@
-# KytyPS5
+# KytyPS5-Legacy
+
+> Legacy fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) — playable-first on older GPUs.
+> Upstream targets modern hardware (mesh shaders, ray tracing). This fork keeps that path intact
+> and adds optional fallbacks so titles that *can* run still boot instead of hard-rejecting the device.
+
+## Why this fork exists
+
+Upstream `KytyPS5/KytyPS5#586` (depthBounds + barycentric + input-stutter fixes) was closed as
+out-of-scope: Pascal (GTX 10-series), Intel UHD 620/630 and similar lack
+`VK_KHR_fragment_shader_barycentric` / `depthBounds`, so upstream rejects them with
+"Could not find suitable device" before any game runs.
+
+This fork reverses that rejection where a correct fallback exists, at zero cost to modern GPUs:
+
+- **barycentric fallback:** without `VK_KHR_fragment_shader_barycentric`, pixel params use
+  standard hardware interpolation instead of PerVertexKHR (verified Lego Brawls on GTX 1070 Ti).
+- **depthBounds fallback:** `depthBoundsTestEnable` forced off per-pipeline when unsupported
+  (verified Dreaming Sarah on Intel UHD 620, same path as MoltenVK).
+- **input-driven stutter fix:** main-loop idle wait bounded to 4ms so `RunOnMainThread()`
+  drains steadily with no input activity.
+- **Aim:** keep adding small, gated legacy paths (boolean feature-gates, no emitter forks)
+  while tracking upstream `main` closely. No 1:1 PS5→Pascal promise — RT / mesh-heavy titles
+  still need modern HW.
+
+Upstream: https://github.com/KytyPS5/KytyPS5 — all credit to them + co-author Mark Laloo.
+Base: upstream `main` @ 16b83a0 (2026-09-26), plus `legacy/*` patches.
+
+---
+
+# KytyPS5 (upstream README follows)
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)

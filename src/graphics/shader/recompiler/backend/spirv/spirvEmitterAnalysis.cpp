@@ -248,7 +248,10 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 	EmitLabel(state, merge_label);
 }
 
-spv::ExecutionModel ExecutionModelForStage(ShaderType stage) {
+spv::ExecutionModel ExecutionModelForStage(ShaderType stage, bool mesh_via_compute) {
+	if (stage == ShaderType::Mesh && mesh_via_compute) {
+		return spv::ExecutionModelGLCompute;
+	}
 	switch (stage) {
 		case ShaderType::Local:
 		case ShaderType::Vertex: return spv::ExecutionModelVertex;

@@ -88,6 +88,12 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
+	// Legacy: without VK_EXT_mesh_shader the program runs as a compute shader that writes
+	// its vertices and indices to host buffers.
+	bool via_compute = false;
+
+	// Every output occupies one vec4 of the per-vertex record written by the compute encoding.
+	static constexpr uint32_t ComputeOutputDwords = 4;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {

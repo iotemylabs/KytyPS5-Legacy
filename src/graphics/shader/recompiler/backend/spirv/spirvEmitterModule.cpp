@@ -602,7 +602,10 @@ void DefineModule(EmitterState& state) {
 		}
 	}
 	state.main_func = state.builder.AllocateId();
-	if (state.program.stage == ShaderType::Mesh) {
+	const bool mesh_via_compute = MeshViaCompute(state);
+	if (mesh_via_compute) {
+		state.mesh_guest_func = state.builder.AllocateId();
+	} else if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
 		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
 		state.builder.RequireExtension("SPV_EXT_mesh_shader");
@@ -621,7 +624,9 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	if (state.program.info.uses_dma) {
+	// The compute encoding of the mesh stage stores its outputs through device addresses.
+	const bool physical_addressing = state.program.info.uses_dma || mesh_via_compute;
+	if (physical_addressing) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -675,7 +680,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(physical_addressing
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

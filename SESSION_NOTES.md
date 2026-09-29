@@ -405,3 +405,42 @@ Draw sizes seen: `DrawIndexAuto` with 1, 30, 128, 135, 800 points and one instan
 
 Next blocker after the abort: none reached in 120 s. The missing geometry is whatever these
 three programs draw (particle-like effects).
+
+## 2026-09-29 (night) — Phase B, stage 1: emitter
+
+### Design decisions
+
+- The IR stage stays `ShaderType::Mesh`. `ShaderMeshInputInfo::via_compute` selects the host
+  encoding and is part of the stage static key.
+- Outputs are stored through **device addresses** passed in push constants, not through a
+  descriptor. Reason: a new descriptor binding kind would change `DescriptorBindingKind::Count`
+  (asserted to be 50) and shift every pixel-stage binding. Device addresses need no layout change.
+- Push constants for the compute encoding: the six existing draw dwords, then vertex buffer
+  address (6,7), index buffer address (8,9), group count (10). `MeshComputeDrawDwordCount = 11`.
+- Vertex record: one vec4 (4 dwords) per entry of `program.info.outputs`, in that order. Layer
+  uses the first dword of its slot.
+- Slot: `WorkgroupId.y * group_count + WorkgroupId.x`. Vertices at `slot * max_vertices + lane`,
+  index triples at `slot * max_primitives + lane`, index values rebased by `slot * max_vertices`.
+- Culled or unallocated primitives are not written; the renderer clears the buffers first.
+
+### Files
+
+| File | Change |
+| --- | --- |
+| `src/graphics/shader/shader.h` | `via_compute`, `ComputeOutputDwords` |
+| `src/graphics/shader/shader.cpp` | `via_compute` in the static key |
+| `src/graphics/shader/recompiler/ir/ShaderIR.h` | push constant slot constants |
+| `backend/spirv/spirvEmitterInternal.h`, `spirvEmitterAnalysis.cpp`, `SpirvEmitter.cpp` | execution model `GLCompute` for the compute encoding |
+| `backend/spirv/spirvEmitterModule.cpp` | no mesh capability or execution modes; physical addressing |
+| `backend/spirv/spirvEmitterMesh.cpp` | no `Output` arrays; epilogue stores to the buffers |
+| `tests/shaderCfgTests.cpp` | `TestMeshExportStorage` also compiles the compute encoding |
+
+### Verification
+
+- `sync-build.sh shader_cfg_tests`: `build rc=0`.
+- `shader_cfg_tests` on the box: exit code 0. The test validates the module with SPIRV-Tools
+  for host subgroup sizes 32 and 64 and checks: entry point is `GLCompute`, no
+  `MeshShadingEXT`, stores go through `OpConvertUToPtr`, push constant dwords 6 to 10 are read.
+- The "error" blocks in the test log come from the suite's expected-failure cases, which run
+  in forked children.
+- Not verified yet: execution on the GPU. That needs stage 2.

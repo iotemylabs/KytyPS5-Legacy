@@ -307,7 +307,11 @@ uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
 
-spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
+spv::ExecutionModel ExecutionModelForStage(ShaderType stage, bool mesh_via_compute = false);
+
+inline bool MeshViaCompute(const EmitterState& state) {
+	return state.program.stage == ShaderType::Mesh && state.input_info.vertex->mesh.via_compute;
+}
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 

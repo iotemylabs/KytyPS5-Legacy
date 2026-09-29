@@ -28,6 +28,68 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 	return kind == IR::StageOutputKind::Layer ? TypeU32(state) : TypeF32Vector(state, 4);
 }
 
+// Legacy: where one workgroup of the compute encoding writes its vertices and indices.
+struct ComputeOutput {
+	uint32_t vertex_address = 0;
+	uint32_t index_address  = 0;
+	uint32_t vertex_base    = 0;
+	uint32_t primitive_base = 0;
+};
+
+uint32_t ConstantU64Scalar(EmitterState& state, uint64_t value) {
+	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
+	                              static_cast<uint32_t>(value),
+	                              static_cast<uint32_t>(value >> 32u));
+}
+
+uint32_t MeshDrawDword(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+	                          state.push_constant_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+uint32_t MeshDrawAddress(EmitterState& state, uint32_t index) {
+	const auto type = TypeScalarU64(state);
+	const auto low  = Unary(state, spv::OpUConvert, type, MeshDrawDword(state, index));
+	const auto high = Unary(state, spv::OpUConvert, type, MeshDrawDword(state, index + 1u));
+	return Binary(state, spv::OpBitwiseOr, type, low,
+	              Binary(state, spv::OpShiftLeftLogical, type, high, ConstantU64Scalar(state, 32)));
+}
+
+void StoreOutputDword(EmitterState& state, uint32_t base, uint32_t dword, uint32_t value) {
+	const auto type   = TypeScalarU64(state);
+	const auto offset = Binary(state, spv::OpShiftLeftLogical, type,
+	                           Unary(state, spv::OpUConvert, type, dword),
+	                           ConstantU64Scalar(state, 2));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          Binary(state, spv::OpIAdd, type, base, offset));
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+	                          alignment);
+}
+
+ComputeOutput PrepareComputeOutput(EmitterState& state) {
+	const auto& mesh     = state.input_info.vertex->mesh;
+	const auto  group    = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+	const auto  instance = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+	const auto  groups   = MeshDrawDword(state, IR::PushData::MeshComputeGroupCount);
+	const auto  slot =
+	    EmitAddU32(state, EmitBinaryU32(state, spv::OpIMul, instance, groups), group);
+	return {
+	    .vertex_address = MeshDrawAddress(state, IR::PushData::MeshComputeVertexAddress),
+	    .index_address  = MeshDrawAddress(state, IR::PushData::MeshComputeIndexAddress),
+	    .vertex_base =
+	        EmitBinaryU32(state, spv::OpIMul, slot, ConstantU32(state, mesh.max_vertices)),
+	    .primitive_base =
+	        EmitBinaryU32(state, spv::OpIMul, slot, ConstantU32(state, mesh.max_primitives)),
+	};
+}
+
 } // namespace
 
 void DefineMeshOutputs(EmitterState& state) {
@@ -39,14 +101,17 @@ void DefineMeshOutputs(EmitterState& state) {
 			EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(output.kind));
 		}
 		const auto type    = MeshOutputType(state, output.kind);
-		output.variable_id = MeshArray(
-		    state, spv::StorageClassOutput, type,
-		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
 		// Only Layer is read by another invocation, through the primitive's provoking vertex.
 		const bool shared = output.kind == IR::StageOutputKind::Layer;
 		output.mesh_data_variable =
 		    MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
 		              shared ? mesh.max_vertices : state.lane_count);
+		if (mesh.via_compute) {
+			continue;
+		}
+		output.variable_id = MeshArray(
+		    state, spv::StorageClassOutput, type,
+		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
 		state.interface_variables.push_back(output.variable_id);
 		state.builder.AddName(output.variable_id, output.debug_name.c_str());
 		if (output.kind == IR::StageOutputKind::Parameter) {
@@ -66,6 +131,9 @@ void DefineMeshOutputs(EmitterState& state) {
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
+	if (mesh.via_compute) {
+		return;
+	}
 	state.mesh_primitives =
 	    MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
 	state.mesh_cull =
@@ -132,14 +200,51 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	                                 TypeU32(state), ConstantU32(state, 0));
 	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
 	                                 TypeU32(state), ConstantU32(state, 1));
-	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
-	                          primitives); // OpSetMeshOutputsEXT
+	const bool    via_compute = MeshViaCompute(state);
+	ComputeOutput compute;
+	if (via_compute) {
+		compute = PrepareComputeOutput(state);
+	} else {
+		state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
+		                          primitives); // OpSetMeshOutputsEXT
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		state.lane_half      = half;
 		const auto index     = EmitLocalInvocationIndex(state);
 		const auto is_vertex = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_vertex, index, vertices);
 		EmitIfCondition(state, is_vertex, [&] {
+			if (via_compute) {
+				const auto record = EmitBinaryU32(
+				    state, spv::OpIMul, EmitAddU32(state, compute.vertex_base, index),
+				    ConstantU32(state, static_cast<uint32_t>(state.outputs.size()) *
+				                           ShaderMeshInputInfo::ComputeOutputDwords));
+				uint32_t dword = 0;
+				for (const auto& output: state.outputs) {
+					const auto at = [&](uint32_t component) {
+						return EmitAddU32(state, record, ConstantU32(state, dword + component));
+					};
+					if (output.kind == IR::StageOutputKind::Layer) {
+						StoreOutputDword(state, compute.vertex_address, at(0),
+						                 MeshLoad(state, output.mesh_data_variable,
+						                          spv::StorageClassWorkgroup, TypeU32(state),
+						                          index));
+					} else {
+						const auto value =
+						    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate,
+						             TypeF32Vector(state, 4), ConstantU32(state, half));
+						for (uint32_t component = 0; component < 4; component++) {
+							const auto f32 = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), f32,
+							                          value, component);
+							StoreOutputDword(state, compute.vertex_address, at(component),
+							                 EmitBitcastF32ToU32(state, f32));
+						}
+					}
+					dword += ShaderMeshInputInfo::ComputeOutputDwords;
+				}
+				return;
+			}
 			for (const auto& output: state.outputs) {
 				if (output.kind == IR::StageOutputKind::Layer) {
 					continue;
@@ -165,6 +270,27 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
 				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+			}
+			if (via_compute) {
+				// The index buffer is cleared before the dispatch: a culled or unallocated
+				// primitive stays the degenerate triangle (0, 0, 0).
+				const auto null_bit = EmitBinaryU32(state, spv::OpBitwiseAnd, packed,
+				                                    ConstantU32(state, 0x80000000u));
+				const auto visible  = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpIEqual, TypeBool(state), visible, null_bit,
+				                          ConstantU32(state, 0));
+				EmitIfCondition(state, visible, [&] {
+					const auto first = EmitBinaryU32(
+					    state, spv::OpIMul, EmitAddU32(state, compute.primitive_base, index),
+					    ConstantU32(state, 3));
+					for (uint32_t component = 0; component < 3; component++) {
+						StoreOutputDword(
+						    state, compute.index_address,
+						    EmitAddU32(state, first, ConstantU32(state, component)),
+						    EmitAddU32(state, compute.vertex_base, vertex[component]));
+					}
+				});
+				return;
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,

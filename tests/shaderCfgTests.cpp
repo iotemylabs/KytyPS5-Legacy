@@ -9655,6 +9655,36 @@ void TestMeshExportStorage() {
     Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }
+  // Legacy: the same program as a compute shader writing host buffers.
+  mesh.via_compute = true;
+  options.back_code = back;
+  for (const auto subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(front, options, nullptr, nullptr,
+                                         PushData::MeshComputeDrawDwordCount);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpEntryPoint GLCompute") != std::string::npos &&
+              source.find("MeshShadingEXT") == std::string::npos &&
+              source.find("OpSetMeshOutputsEXT") == std::string::npos,
+          "compute-encoded mesh shader still depends on the mesh stage");
+    Check(source.find("OpConvertUToPtr") != std::string::npos,
+          "compute-encoded mesh shader does not store through the output addresses");
+    for (const auto dword :
+         {PushData::MeshComputeVertexAddress, PushData::MeshComputeVertexAddress + 1u,
+          PushData::MeshComputeIndexAddress, PushData::MeshComputeIndexAddress + 1u,
+          PushData::MeshComputeGroupCount}) {
+      const auto operand = "vsharp %uint_0 %uint_" + std::to_string(dword);
+      Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
+            "compute-encoded mesh shader does not read its output placement");
+    }
+    const auto reg =
+        std::ranges::find(result.program.bindings.user_data_registers, 13u);
+    Check(result.program.bindings.UsesPushData() &&
+              reg != result.program.bindings.user_data_registers.end(),
+          "compute-encoded mesh shader lost its user data behind the draw prefix");
+  }
+  mesh.via_compute = false;
 }
 
 void TestMergedShaderUserDataSnapshot() {

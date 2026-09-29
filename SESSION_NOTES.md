@@ -278,3 +278,79 @@ Where it dies:
 
 Limits confirmed on hardware, code path confirmed by two logs, no prior fallback work
 exists. Waiting for Brett's decision on Phase B.
+
+## 2026-09-29 (evening) — Phase B, step 1: design doc
+
+Brett approved Phase B and asked for the design doc first.
+
+### Code study (read, not changed)
+
+- Recompiler pipeline: `TranslateProgram` / `CompileProgram` in
+  `src/graphics/shader/recompiler/ShaderRecompiler.cpp`; fused front+back decode in
+  `DecodeFusedProgram`.
+- Mesh prolog `Translate.cpp:1096`, `GS_ALLOC_REQ` handling `Control.cpp:193`, export staging
+  `spirvEmitterFlow.cpp:440`, epilogue `spirvEmitterMesh.cpp:124`.
+- Only compute pipelines request a subgroup size (`shaders.cpp:573`); the mesh path uses the
+  driver default (`pipelineCache.cpp` sets `host_subgroup_size = m_graphics.subgroup_size`).
+- Compute dispatches already end and resume rendering (`renderCompute.cpp:366`).
+- In-tree precedent for generated bridge shaders: `src/graphics/shader/rectListShader.cpp`.
+
+### External references checked
+
+- MoltenVK compiles the vertex stage of tessellated pipelines as a compute kernel (its
+  changelog and `MVKPipeline.mm`). Same idea as compute expansion.
+- shadPS4 added geometry shader support by translating to Vulkan geometry shaders; that is
+  the PS4 legacy ES/GS ring-buffer pipeline, not NGG.
+
+### Output
+
+- `docs/bc250-mesh-fallback.md` — compares compute expansion, vertex+geometry, and five other
+  options. Recommends: stage 0 skip-and-log, then compute expansion with fixed output slots.
+
+### Build environment on the box
+
+| Step | Command / result |
+| --- | --- |
+| Distrobox | `distrobox create --name kyty-build --image registry.fedoraproject.org/fedora-toolbox:44 --yes` |
+| Packages (inside the box only) | clang lld ninja-build cmake git glslang pkgconf, X11/Wayland/xkbcommon/ALSA/Pulse/udev/dbus/libdecor/pipewire devel packages, python3, rsync. 187 packages, `dnf rc=0` |
+| Source tree | `~/kyty-bc250/src`: `git clone` of the fork at `a9ef675`, `git submodule update --init --recursive --depth 1` (314 MiB) |
+| Sync method | `git diff a9ef675 --binary` on the PC, piped over SSH, `git apply` on the box |
+| Build | `cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DKYTY_BUILD_LAUNCHER=OFF`, target `kyty_emulator`, `--parallel 4` (limited for the 7.5 GiB of RAM) |
+| Logs | `~/kyty-bc250/logs/` on the box |
+
+Decision: sync by patch instead of copying the working tree. The PC checkout has
+`core.autocrlf=true`, so its files are CRLF on disk; a patch keeps the box tree LF and identical
+to what git records. The PC also has no `rsync`.
+
+### Diagnostic change (small, not the fallback)
+
+`pipelineCache.cpp`: before the existing abort, log the GS program's hash and mesh parameters
+(`Mesh fallback needed: ...`). Purpose: fill in the "Measured" section of the design doc.
+
+### Baseline build and diagnostic run
+
+- Build: 857 steps, 7 minutes (18:52 to 18:59), `build rc=0`, 138 warnings, no errors.
+  Binary `~/kyty-bc250/src/_Build/linux-no-qt/kyty_emulator`; build tree 784 MiB; 51 GiB free after.
+- Run from isolated cwd `~/kyty-bc250/run-b0/`, same arguments and environment as the A4 run.
+  Exit code 65, same abort (now reported at `pipelineCache.cpp:608` because of the added lines).
+- Logs copied to `..\diag\run-b0\`.
+
+Result:
+
+```
+Mesh fallback needed: hash=0x4e555b0ebf3b53f8 fused=true code_words=56+852 input_primitive=1
+wave=64 threads=256 max_vertices=216 max_primitives=210 primitives_per_group=3
+vertices_per_group=3 lds_dwords=3072 scratch_dwords=0 provoking=0
+```
+
+Reading: a fused `kGsFront`+`kGsBack` program, point list input, 3 points per group, up to 72
+vertices / 70 triangles per point, 4 waves of 64, 12 KiB of LDS. Everything fits the device's
+compute limits. It does not fit a host geometry shader (1024 total output components over 72
+vertices leaves 14 components per vertex).
+
+Design doc updated with these numbers.
+
+### Status
+
+Stopped for approval of the approach (Phase B step 2). No fallback code written. The only
+source change on the branch is the diagnostic log line.

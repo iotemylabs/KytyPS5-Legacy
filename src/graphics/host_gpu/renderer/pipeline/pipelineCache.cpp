@@ -591,6 +591,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
+		if (!m_graphics.mesh_shader_enabled) {
+			// Legacy: describe the merged GS program a mesh shader fallback would have to run.
+			const auto& info = vertex_info[0].mesh;
+			PipelineCacheLog("Mesh fallback needed: hash=0x{:016x} fused={} code_words={}+{} "
+			                 "input_primitive={} wave={} threads={} max_vertices={} "
+			                 "max_primitives={} primitives_per_group={} vertices_per_group={} "
+			                 "lds_dwords={} scratch_dwords={} provoking={}",
+			                 vertex_params[0].hash, !vertex_params[0].back_code.empty(),
+			                 vertex_params[0].code.size(), vertex_params[0].back_code.size(),
+			                 info.input_primitive, info.wave_size, info.threads_num[0],
+			                 info.max_vertices, info.max_primitives, info.primitives_per_group,
+			                 info.vertices_per_group, info.lds_size_dwords,
+			                 info.scratch_size_dwords, info.provoking_vertex);
+		}
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;

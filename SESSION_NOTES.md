@@ -2,7 +2,7 @@
 
 Branch: `bc250-mesh-fallback` (base: `a9ef675`, KytyPS5-Legacy main, upstream base `16b83a0`)
 Target: AMD BC-250 (RADV, GFX1013 / GFX10.1) on Bazzite, host `bazzite@192.168.1.7`
-Test game: ASTRO BOT (PPSA21564) — path on the Bazzite box not yet known
+Test game: ASTRO BOT (PPSA21564, v01.007.000) at `/home/bazzite/Emulation/storage/kytyps5/PPSA21564-app/eboot.bin`
 
 ## 2026-09-29 — Phase A
 
@@ -14,7 +14,7 @@ Test game: ASTRO BOT (PPSA21564) — path on the Bazzite box not yet known
 - Local tooling gaps: no `rsync` and no `gh` in Git Bash on this PC. Sync will need
   `tar | ssh` or `scp` unless rsync is installed. GitHub searched through the REST API.
 
-### SSH status (BLOCKED — needs Brett)
+### SSH status (resolved later the same day — see "Phase A, on-box")
 
 | Attempt | Result |
 | --- | --- |
@@ -158,8 +158,123 @@ Astro Bot data points from upstream issues:
 - Did not touch `~/.ssh/config`; the new key is passed with `-i`.
 - Phase B not started. Waiting for approval and for SSH access.
 
-### Open items
+### Open items (at that point)
 
-1. Brett: authorise `~/.ssh/bazzite_bc250.pub` on the box.
-2. Brett: confirm game title (assumed ASTRO BOT) and its path on the box.
-3. Then: A1/A2 capture, A4 log capture, confirm the table above.
+All closed later the same day: key authorised, game path found on the box, captures done.
+
+## 2026-09-29 (later) — Phase A, on-box
+
+Brett installed `~/.ssh/bazzite_bc250.pub`. All commands below use
+`ssh -i ~/.ssh/bazzite_bc250 -o IdentitiesOnly=yes -o BatchMode=yes bazzite@192.168.1.7`.
+
+### A1 — versions
+
+| Item | Value |
+| --- | --- |
+| OS | Bazzite 44.20260929.0 (Kinoite), image `bazzite-deck-44.20260929` |
+| Kernel | `7.2.7-ogc1.1.fc44.x86_64` |
+| Mesa | `mesa-vulkan-drivers-26.2.2-3.fc44` (RADV 26.2.2) |
+| Vulkan | instance 1.4.341, device apiVersion 1.4.354, conformance 1.4.5.3 |
+| Device | `AMD BC-250 (RADV GFX1013)`, 1002:13fe, integrated |
+| Session | KDE Plasma Wayland (`wayland-0`, Xwayland `:0`) |
+| Memory / disk | 7.5 GiB system RAM visible; `/var/home` 54 GiB free (95% used) |
+| Tools on host | `vulkaninfo`, `distrobox`, `podman`, `rsync` present; no distrobox created yet |
+
+Captured with `vulkaninfo --summary` and `vulkaninfo` into `~/kyty-bc250/diag/` on the box,
+copied to `..\diag\` next to this repo on the PC (`vulkaninfo-summary.txt`,
+`vulkaninfo-full.txt`, `versions.txt`). Kept out of the repo (size).
+
+### A2 — confirmed limits (GPU0 section of `vulkaninfo-full.txt`)
+
+| Item | Result |
+| --- | --- |
+| `VK_EXT_mesh_shader` | **NO** (extension absent, no `meshShader`/`taskShader` feature) |
+| `VK_KHR_fragment_shader_barycentric` | **NO** |
+| `VK_KHR_ray_tracing_pipeline` | YES (rev 1; `rayTracingPipeline = true`; also `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`) |
+| `geometryShader` | YES |
+| `depthBounds` | YES |
+| `VK_EXT_image_view_min_lod` | YES (`minLod = true`) |
+| `multiDrawIndirect` | YES |
+| `drawIndirectCount` | YES (`maxDrawIndirectCount = 4294967295`) |
+
+Every row matches the prediction made from Mesa source.
+
+Numbers that matter for a fallback:
+
+| Limit | Value |
+| --- | --- |
+| Subgroup size | default 64, min 32, max 64; size control required stages: fragment, compute |
+| `maxComputeWorkGroupInvocations` / size | 1024 / 1024x1024x1024 |
+| `maxComputeSharedMemorySize` | 65536 bytes |
+| `maxComputeWorkGroupCount` | 4294967295 x 65535 x 65535 |
+| `maxGeometryOutputVertices` | 256 |
+| `maxGeometryTotalOutputComponents` | 1024 |
+| `maxGeometryInputComponents` / output | 64 / 128 |
+| `maxPushConstantsSize` | 256 |
+| Transform feedback | yes, 4 buffers, 512 bytes stream data |
+| Queues | one graphics+compute+transfer queue; no separate compute queue |
+
+The missing separate compute queue agrees with Mesa's "GFX1013 is known to have broken
+compute queue". Compute shaders on the graphics queue work: the emulator built and ran 16
+compute pipelines before the abort.
+
+### A4 — game run
+
+Emulator on the box: prebuilt fork build `a9ef675` (same commit as this branch's base) at
+`~/Downloads/KytyPS5-2026-09-26-a9ef675-Linux-x86_64/`.
+
+- Brett's own log from 18:22 was already there (16462 lines). Copied, not modified:
+  `..\diag\user-run-2026-09-29-1822_kyty.txt`.
+- Own run, from an isolated cwd `~/kyty-bc250/run-a4/` so the emulator's relative
+  `_SaveData`, `_TempData`, `_DownloadData`, `_PipelineCache` and `_kyty.txt` landed there
+  and nothing in the install directory or the game directory was written.
+- Arguments copied from `kyty_run.sh`. Environment:
+  `XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 DISPLAY=:0
+  XAUTHORITY=/run/user/1000/xauth_* DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`,
+  `timeout 240`, stdin from `/dev/null`.
+- **Launching over SSH works.** Run lasted 4 s, exit code 65.
+- Log: `..\diag\run-a4\_kyty.txt` (16166 lines), `stdout.txt`.
+
+Result, identical in both runs:
+
+```
+--- Build ---
+Fork build Hultwl/KytyPS5-Legacy a9ef675
+--- Fatal Error ---
+Not implemented (!m_graphics.mesh_shader_enabled) in .../pipelineCache.cpp:594
+```
+
+Startup lines confirm the device state:
+
+```
+Select device: AMD BC-250 (RADV GFX1013)
+fragmentShaderBarycentric support: No (fallback)
+Vulkan subgroup: default=64 min=32 max=64 stages=0x00000030 size_control=true wave64=true
+```
+
+Where it dies:
+
+- Last shader count: `VS 5 | PS 4 | CS 16 | GS 0`. The GS draw is in the first rendered
+  frames, about 2 s of guest time in. There is no way to get further in this title without
+  the fallback.
+- Last markers before the abort: `... WaterStream_0`, `WaitAsyncFluidTr_0`, `FluidBase_0`,
+  `Distortion_0`. The draw belongs to the transparent/distortion part of the frame.
+- The abort is before the GS program is translated, so the log has no GS hash, primitive
+  type or `kGsFront`/`kGsBack` information. Getting those needs a build with one extra log
+  line ahead of the check — first thing to do once a build exists.
+- Also seen: `Warning: ray tracing is not implemented; skipping compute dispatches
+  containing BVH intersection instructions`. The emulator skips RT itself, so the BC-250's
+  native RT support is unused.
+- No cheat/patch lines in the log. Upstream issue #835 says Astro Bot needs two patches to
+  get past the splash on any GPU; that is likely the next blocker after this one.
+
+### State left on the Bazzite box
+
+- `~/kyty-bc250/diag/` — vulkaninfo captures
+- `~/kyty-bc250/run-a4/` — logs and emulator scratch dirs from the A4 run
+- Nothing else created or changed. No distrobox, no packages, no system config.
+
+### Phase A conclusion
+
+Limits confirmed on hardware, code path confirmed by two logs, no prior fallback work
+exists. Waiting for Brett's decision on Phase B.

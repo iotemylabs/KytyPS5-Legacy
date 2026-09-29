@@ -354,3 +354,54 @@ Design doc updated with these numbers.
 
 Stopped for approval of the approach (Phase B step 2). No fallback code written. The only
 source change on the branch is the diagnostic log line.
+
+## 2026-09-29 (night) — Phase B, stage 0: skip and log
+
+Brett approved: stage 0, then compute expansion. The force-fallback switch and a second test
+title were not approved or named, so neither is included.
+
+### Change
+
+- `pipelineCache.cpp`, `GetGraphicsPrograms`: when the draw needs the mesh stage and the device
+  has no mesh shaders, log the program once per hash and return no programs (was: abort).
+- `renderDraw.cpp`, `PrepareDrawRenderState`: a draw with no vertex program is dropped; the
+  first 64 and every power-of-two count are logged with primitive, index and instance counts.
+- Devices with mesh shaders never enter either branch.
+
+### Helper scripts (on the PC, outside the repo, `..\scripts\`)
+
+- `sync-build.sh [targets]` — patch sync plus incremental build in the distrobox.
+- `run-game.sh <run-name> [timeout]` — run ASTRO BOT from `~/kyty-bc250/<run-name>/`.
+
+### Result
+
+| Item | Value |
+| --- | --- |
+| Build | incremental, `build rc=0` |
+| Run `run-s0`, 120 s timeout | exit code 124: still running when the timeout ended it. No abort |
+| Shaders compiled | VS 26, PS 30, CS 37 when stopped |
+| GS draws skipped | more than 65,536 in 120 s |
+| Other warnings | only the known "ray tracing is not implemented" line |
+| Process | about 2.4 GiB resident, about 210% CPU |
+| Frame rate (window title) | 19 fps at frame 1523, 16 fps at frame 2152 |
+| What renders | intro sequence: star field with particles, then the light-streak tunnel |
+
+Screenshots (`spectacle -b -n -a`, active window only): `..\diag\run-s0\shot-50s.png`,
+`shot-85s.png`.
+
+GS programs seen:
+
+| Hash | Fused | Words | Input | Threads | Max vertices | Max primitives | Per group | LDS dwords |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `0x4e555b0ebf3b53f8` | yes | 56+852 | points | 256 | 216 | 210 | 3 | 3072 |
+| `0xc739f9614016bed4` | yes | 68+3648 | points | 128 | 80 | 40 | 20 | 4096 |
+| `0x2b3be82b8235ac05` | no | 4164 | points | 192 | 190 | 152 | 19 | 128 |
+
+All three take point lists. The third is a single merged binary rather than a front/back pair,
+and its 190/152 limits match the program described in upstream PR #741.
+
+Draw sizes seen: `DrawIndexAuto` with 1, 30, 128, 135, 800 points and one instance;
+`DrawIndex` with 1 index and 512 instances.
+
+Next blocker after the abort: none reached in 120 s. The missing geometry is whatever these
+three programs draw (particle-like effects).

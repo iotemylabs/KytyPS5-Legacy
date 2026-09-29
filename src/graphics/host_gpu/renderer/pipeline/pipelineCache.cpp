@@ -26,10 +26,12 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -590,9 +592,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
-	if (mesh_active) {
-		if (!m_graphics.mesh_shader_enabled) {
-			// Legacy: describe the merged GS program a mesh shader fallback would have to run.
+	if (mesh_active && !m_graphics.mesh_shader_enabled) {
+		// Legacy: without VK_EXT_mesh_shader the merged GS draw is dropped, not fatal.
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		const std::lock_guard               lock(logged_mutex);
+		if (logged.insert(vertex_params[0].hash).second) {
 			const auto& info = vertex_info[0].mesh;
 			PipelineCacheLog("Mesh fallback needed: hash=0x{:016x} fused={} code_words={}+{} "
 			                 "input_primitive={} wave={} threads={} max_vertices={} "
@@ -605,7 +610,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			                 info.vertices_per_group, info.lds_size_dwords,
 			                 info.scratch_size_dwords, info.provoking_vertex);
 		}
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		return {};
+	}
+	if (mesh_active) {
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;

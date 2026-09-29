@@ -882,6 +882,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
 	RefreshShaders(buffer, draw, state);
+	if (!state.programs.vertex[0]) {
+		// Legacy: the pipeline cache refused a merged GS program this device cannot run.
+		static std::atomic<uint32_t> skipped {0};
+		const auto                   count = skipped.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 64u || (count & (count - 1u)) == 0u) {
+			LOGF("Mesh fallback: skipped %s #%u primitive=%u indices=%u instances=%u\n",
+			     draw.Name(), count,
+			     static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()), draw.index_count,
+			     draw.instance_count);
+		}
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

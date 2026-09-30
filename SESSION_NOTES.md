@@ -492,3 +492,19 @@ Draws that would not fit the buffer or the compute workgroup limits are skipped 
 - No slicing: a draw whose output exceeds 64 MiB or 65535 instances is skipped.
 - Fixed slots: every group submits `max_primitives` triangles; unused ones are degenerate.
 - Two buffer fills and one render pass break per GS draw.
+
+## 2026-09-30 — Phase B, stage 3: instance slicing
+
+- `renderDraw.cpp`: the compute encoding now dispatches instances in slices. The slice size is
+  the largest instance count whose vertices and indices fit the 64 MiB output buffer and the
+  device's `maxComputeWorkGroupCount[1]`. Each slice: clear, dispatch with its own
+  `first_instance`, barrier, resume rendering, `drawIndexed`. Graphics bindings, vertex and
+  index buffer bindings and dynamic state persist across the render pass break, so only the
+  first slice commits them.
+- Draws where a single instance does not fit (too many groups) are still skipped with a log
+  line. Slicing by group would need a base-group push constant in the mesh prolog, as upstream
+  PR #793 does for the mesh path. Not needed by anything seen so far.
+- Test: with the slice size temporarily capped at 100 instances, ASTRO BOT's 512-instance
+  draws ran as six slices each under Vulkan validation with no error attributed to the
+  fallback (the run ends at the pre-existing interface error, as before). Cap removed.
+- Normal run `run-s3`, 90 s: no abort, no skipped draws.

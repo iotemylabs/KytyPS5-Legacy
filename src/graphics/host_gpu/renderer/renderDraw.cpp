@@ -1040,8 +1040,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Legacy: the mesh program runs as a compute shader and its output is drawn afterwards.
 	const bool mesh_via_compute = mesh_active && state.vertex_info[0].mesh.via_compute;
 	uint32_t   mesh_groups      = 0;
-	uint64_t   mesh_vertex_bytes = 0;
-	uint64_t   mesh_index_bytes  = 0;
+	// Compute encoding: instances are dispatched in slices that fit the output buffer.
+	uint32_t   mesh_slice_instances  = 0;
+	uint64_t   mesh_slot_vertex_bytes = 0;
+	uint64_t   mesh_slot_index_bytes  = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
@@ -1062,23 +1064,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (mesh_via_compute) {
 			const auto& host =
 			    m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
-			const auto slots   = static_cast<uint64_t>(mesh_groups) * draw.instance_count;
 			const auto outputs = state.vertex_info[0].stage.program->info.outputs.size();
-			mesh_vertex_bytes  = slots * mesh.max_vertices * outputs *
-			                     ShaderMeshInputInfo::ComputeOutputDwords * sizeof(uint32_t);
-			mesh_index_bytes   = slots * mesh.max_primitives * 3u * sizeof(uint32_t);
-			if (mesh_groups > host.maxComputeWorkGroupCount[0] ||
-			    draw.instance_count > host.maxComputeWorkGroupCount[1] ||
-			    mesh_vertex_bytes + mesh_index_bytes > BufferCache::MeshOutputBufferSize) {
+			mesh_slot_vertex_bytes = static_cast<uint64_t>(mesh.max_vertices) * outputs *
+			                         ShaderMeshInputInfo::ComputeOutputDwords * sizeof(uint32_t);
+			mesh_slot_index_bytes = static_cast<uint64_t>(mesh.max_primitives) * 3u *
+			                        sizeof(uint32_t);
+			const auto instance_bytes =
+			    mesh_groups * (mesh_slot_vertex_bytes + mesh_slot_index_bytes);
+			const auto budget = std::min<uint64_t>(host.maxComputeWorkGroupCount[1],
+			                                       BufferCache::MeshOutputBufferSize / instance_bytes);
+			if (mesh_groups > host.maxComputeWorkGroupCount[0] || budget == 0) {
+				// One instance alone does not fit; slicing by group needs a base-group
+				// parameter in the prolog and is not implemented.
 				static std::atomic<uint32_t> skipped {0};
 				if (skipped.fetch_add(1, std::memory_order_relaxed) < 64u) {
 					LOGF("Mesh fallback: skipped oversized %s groups=%u instances=%u "
-					     "bytes=%" PRIu64 "\n",
-					     draw.Name(), mesh_groups, draw.instance_count,
-					     mesh_vertex_bytes + mesh_index_bytes);
+					     "instance_bytes=%" PRIu64 "\n",
+					     draw.Name(), mesh_groups, draw.instance_count, instance_bytes);
 				}
 				return;
 			}
+			mesh_slice_instances =
+			    static_cast<uint32_t>(std::min<uint64_t>(budget, draw.instance_count));
 		}
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		if (mesh_via_compute) {
@@ -1145,22 +1152,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	if (mesh_via_compute) {
-		auto&      output  = m_context.GetBufferCache().GetMeshOutputBuffer();
-		const auto address = output.BufferDeviceAddress();
-		const auto indices = address + mesh_vertex_bytes;
+	// Compute encoding: one slice of instances through the mesh program into the output
+	// buffer. The buffer holds vertices first, then the index triples of the slice.
+	const auto mesh_slice_vertex_bytes =
+	    static_cast<uint64_t>(mesh_groups) * mesh_slice_instances * mesh_slot_vertex_bytes;
+	const auto run_mesh_slice = [&](uint32_t first_instance, uint32_t instances) {
+		auto&      output      = m_context.GetBufferCache().GetMeshOutputBuffer();
+		const auto address     = output.BufferDeviceAddress();
+		const auto indices     = address + mesh_slice_vertex_bytes;
+		const auto index_bytes = static_cast<uint64_t>(mesh_groups) * instances * mesh_slot_index_bytes;
 		// Culled and unallocated primitives stay the degenerate triangle (0, 0, 0), which can
 		// only reach the first vertex record.
 		const auto record_bytes = state.vertex_info[0].stage.program->info.outputs.size() *
 		                          ShaderMeshInputInfo::ComputeOutputDwords * sizeof(uint32_t);
 		output.Fill(0, record_bytes, 0);
-		output.Fill(mesh_vertex_bytes, mesh_index_bytes, 0);
+		output.Fill(mesh_slice_vertex_bytes, index_bytes, 0);
 		buffer.EndRendering();
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *mesh_pipeline, stages.first(1));
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance,
+		    first_instance,
 		    index_source.guest_element_size,
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u),
@@ -1178,7 +1190,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, mesh_pipeline->pipeline);
-		vk_buffer.dispatch(mesh_groups, draw.instance_count, 1);
+		vk_buffer.dispatch(mesh_groups, instances, 1);
 		vk::BufferMemoryBarrier produced {};
 		produced.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 		produced.dstAccessMask =
@@ -1187,7 +1199,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		produced.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		produced.buffer              = output.Handle();
 		produced.offset              = 0;
-		produced.size                = mesh_vertex_bytes + mesh_index_bytes;
+		produced.size                = mesh_slice_vertex_bytes + index_bytes;
 		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 		                          vk::PipelineStageFlagBits::eVertexInput, vk::DependencyFlags {},
 		                          0, nullptr, 1, &produced, 0, nullptr);
@@ -1196,10 +1208,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
+		return static_cast<uint32_t>(index_bytes / sizeof(uint32_t));
+	};
+	uint32_t mesh_slice_index_count = 0;
+	if (mesh_via_compute) {
+		mesh_slice_index_count = run_mesh_slice(emit.first_instance, mesh_slice_instances);
+		auto&                output        = m_context.GetBufferCache().GetMeshOutputBuffer();
 		const vk::Buffer     vertex_buffer = output.Handle();
 		const vk::DeviceSize vertex_offset = 0;
 		vk_buffer.bindVertexBuffers(0, 1, &vertex_buffer, &vertex_offset);
-		vk_buffer.bindIndexBuffer(output.Handle(), mesh_vertex_bytes, vk::IndexType::eUint32);
+		vk_buffer.bindIndexBuffer(output.Handle(), mesh_slice_vertex_bytes, vk::IndexType::eUint32);
 	} else if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -1240,8 +1258,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	if (mesh_via_compute) {
-		vk_buffer.drawIndexed(static_cast<uint32_t>(mesh_index_bytes / sizeof(uint32_t)), 1, 0, 0,
-		                      0);
+		vk_buffer.drawIndexed(mesh_slice_index_count, 1, 0, 0, 0);
+		// Further slices reuse the buffer; graphics state persists across the render pass break.
+		for (uint32_t done = mesh_slice_instances; done < draw.instance_count;
+		     done += mesh_slice_instances) {
+			const auto instances = std::min(mesh_slice_instances, draw.instance_count - done);
+			const auto index_count = run_mesh_slice(emit.first_instance + done, instances);
+			m_context.GetCommandScheduler().BeginRendering(rendering);
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+			vk_buffer.drawIndexed(index_count, 1, 0, 0, 0);
+		}
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {

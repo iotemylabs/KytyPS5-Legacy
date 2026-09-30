@@ -552,3 +552,11 @@ path on a mesh-capable GPU would pay the same.
 - Run directories `run-*` under `~/kyty-bc250/` hold logs and screenshots of every run.
 - Distrobox `kyty-build` has the toolchain, Mesa and the validation layers.
 - Nothing on the host outside `~` was changed.
+
+## 2026-09-30 — pushed
+
+Brett asked for the branch on his GitHub. Stored credentials are for `iotemylabs`; no fork
+existed, so with Brett's confirmation I forked `Hultwl/KytyPS5-Legacy` to
+`iotemylabs/KytyPS5-Legacy` through the GitHub API, added it as remote `fork`, and pushed
+`bc250-mesh-fallback` (8 commits on `a9ef675`). `origin` still points at Hultwl's repo and was
+not pushed to.

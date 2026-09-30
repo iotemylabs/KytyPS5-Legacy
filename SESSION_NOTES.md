@@ -508,3 +508,47 @@ Draws that would not fit the buffer or the compute workgroup limits are skipped 
   draws ran as six slices each under Vulkan validation with no error attributed to the
   fallback (the run ends at the pre-existing interface error, as before). Cap removed.
 - Normal run `run-s3`, 90 s: no abort, no skipped draws.
+
+## 2026-09-30 — Phase B, stage 4: cost measurement and clean-up
+
+### Method
+
+`..\scripts\fps-sample.sh`: run the current box build for 112 s, screenshot the window at
+40, 55, 70, 85 and 100 s; the emulator's window title carries the frame counter and fps.
+Screenshots and cropped title bars in `..\diag\fps\`. Same intro sequence every run.
+
+### Results
+
+| Build | fps at 40/55/70/85/100 s | frame at 100 s |
+| --- | --- | --- |
+| stage 0 (GS draws skipped entirely) | 20 / 20 / 22 / 21 / 21 | 2714 |
+| stage 3 (fallback) | 16 / 17 / 17 / 17 / 16 | 2341 |
+| stage 3, dispatch kept, `drawIndexed` skipped | 18 / 16 / 16 / 17 / 16 | 2381 |
+| stage 3, dispatch and draw both skipped | 14 / 16 / 16 / 17 / 16 | 2357 |
+| stage 4 (no buffer clears) | 16 / 16 / 16 / 16 / 17 | 2315 |
+| stage 4, whole compute block and draw skipped (only draw preparation, bindings, render pass) | 16 / 17 / 17 / 17 / 16 | 2369 |
+
+Reading: the fallback costs about 14 % of frames over the intro, but none of it is the
+fallback's GPU work. Skipping the dispatch, the draw, the clears, or all of them leaves the
+frame rate unchanged. The cost is the emulator's ordinary per-draw preparation (descriptor
+resolution, render target acquisition, pipeline lookup, bindings) for the roughly 34
+geometry shader draws per frame that stage 0 dropped before any of that ran. A native mesh
+path on a mesh-capable GPU would pay the same.
+
+### Change kept from the experiments
+
+- Emitter: the compute epilogue now writes an index triple for **every** primitive slot of
+  the workgroup (its own primitive when allocated and visible, otherwise the degenerate
+  `(base, base, base)`), so the renderer no longer clears anything before the dispatch. The
+  two `Fill` calls and their four barriers per draw are gone; one buffer barrier
+  (vertex input read → compute write) protects buffer reuse.
+- Verified: `shader_cfg_tests` exit 0; validation run inside the distrobox clean for the
+  fallback (ends at the pre-existing interface error, as before); normal run `run-s4-final`
+  renders the intro as before.
+
+### State on the box
+
+- `~/kyty-bc250/src` holds the branch tree (synced by patch), build in `_Build/linux-no-qt`.
+- Run directories `run-*` under `~/kyty-bc250/` hold logs and screenshots of every run.
+- Distrobox `kyty-build` has the toolchain, Mesa and the validation layers.
+- Nothing on the host outside `~` was changed.

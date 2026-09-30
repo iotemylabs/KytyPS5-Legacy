@@ -258,6 +258,58 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				state.builder.AddFunction(spv::OpStore, pointer, value);
 			}
 		});
+		if (via_compute) {
+			// Every primitive slot of the workgroup gets a triple: the lane's own primitive when
+			// it is allocated and visible, otherwise the degenerate triangle (base, base, base).
+			// Nothing has to be cleared before the dispatch.
+			const auto& mesh    = state.input_info.vertex->mesh;
+			const auto  threads = mesh.threads_num[0];
+			const auto  packed  = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
+			                               TypeU32(state), ConstantU32(state, half));
+			const auto  null_bit =
+			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
+			const auto visible = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), visible, null_bit,
+			                          ConstantU32(state, 0));
+			const auto allocated = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpULessThan, TypeBool(state), allocated, index,
+			                          primitives);
+			const auto live = EmitLogicalAndBool(state, allocated, visible);
+			uint32_t   corner[3] {};
+			for (uint32_t component = 0; component < 3; component++) {
+				const auto vertex = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), vertex, packed,
+				                          ConstantU32(state, component * 10u),
+				                          ConstantU32(state, 10));
+				corner[component] =
+				    Select(state, TypeU32(state), live,
+				           EmitAddU32(state, compute.vertex_base, vertex), compute.vertex_base);
+			}
+			for (uint32_t pass = 0; pass * threads < mesh.max_primitives; pass++) {
+				const auto slot = pass == 0 ? index
+				                            : EmitAddU32(state, index,
+				                                         ConstantU32(state, pass * threads));
+				const auto write = [&] {
+					const auto first = EmitBinaryU32(
+					    state, spv::OpIMul, EmitAddU32(state, compute.primitive_base, slot),
+					    ConstantU32(state, 3));
+					for (uint32_t component = 0; component < 3; component++) {
+						StoreOutputDword(state, compute.index_address,
+						                 EmitAddU32(state, first, ConstantU32(state, component)),
+						                 pass == 0 ? corner[component] : compute.vertex_base);
+					}
+				};
+				if ((pass + 1u) * threads <= mesh.max_primitives) {
+					write();
+				} else {
+					const auto in_range = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_range, slot,
+					                          ConstantU32(state, mesh.max_primitives));
+					EmitIfCondition(state, in_range, write);
+				}
+			}
+			continue;
+		}
 		const auto is_primitive = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_primitive, index,
 		                          primitives);
@@ -270,27 +322,6 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
 				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
-			}
-			if (via_compute) {
-				// The index buffer is cleared before the dispatch: a culled or unallocated
-				// primitive stays the degenerate triangle (0, 0, 0).
-				const auto null_bit = EmitBinaryU32(state, spv::OpBitwiseAnd, packed,
-				                                    ConstantU32(state, 0x80000000u));
-				const auto visible  = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpIEqual, TypeBool(state), visible, null_bit,
-				                          ConstantU32(state, 0));
-				EmitIfCondition(state, visible, [&] {
-					const auto first = EmitBinaryU32(
-					    state, spv::OpIMul, EmitAddU32(state, compute.primitive_base, index),
-					    ConstantU32(state, 3));
-					for (uint32_t component = 0; component < 3; component++) {
-						StoreOutputDword(
-						    state, compute.index_address,
-						    EmitAddU32(state, first, ConstantU32(state, component)),
-						    EmitAddU32(state, compute.vertex_base, vertex[component]));
-					}
-				});
-				return;
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,

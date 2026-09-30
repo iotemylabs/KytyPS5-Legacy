@@ -1,6 +1,7 @@
 # Mesh shader fallback for GPUs without `VK_EXT_mesh_shader`
 
-Status: **design, awaiting approval** — no fallback code written yet.
+Status: **implemented** (stages 0–4 on branch `bc250-mesh-fallback`); the design below was
+approved on 2026-09-29 and built as described, with the deviations listed in section 11.
 Branch: `bc250-mesh-fallback`. Target: AMD BC-250 (RADV GFX1013, Mesa 26.2.2).
 Background and raw data: [`SESSION_NOTES.md`](../SESSION_NOTES.md).
 
@@ -280,3 +281,36 @@ path on other hardware. Worth having, but it is a new option and therefore Brett
 1. Approve stage 0 plus approach A, or choose differently.
 2. Force-fallback override for testing on mesh-capable GPUs: yes or no.
 3. A second test title, if one is available on the box.
+
+## 11. Outcome (2026-09-30)
+
+Implemented as recommended: stage 0 skip-and-log, then compute expansion with fixed output
+slots, instance slicing, and a measurement pass. Details and every command are in
+[`SESSION_NOTES.md`](../SESSION_NOTES.md).
+
+| Item | Result |
+| --- | --- |
+| ASTRO BOT on the BC-250 | boots, runs the intro and reaches the title screen; GS particles render |
+| GS programs seen | three, all point-list input (216/210, 80/40 and 190/152 vertices/primitives per group) |
+| Correctness checks | GPU readback of the output buffer (real triangles across several workgroups, no bad indices); opaque rendering test; Vulkan validation clean for the fallback |
+| Cost | about 14 % fewer frames over the intro than skipping the draws; all of it is per-draw CPU preparation the emulator does for any draw, none is the compute encoding |
+| Frame rate | 16–17 fps in the intro (stage 0: 20–22 fps) |
+
+Deviations from the plan:
+
+- Outputs are written through device addresses from push constants, not through a descriptor
+  (avoids changing the descriptor binding layout).
+- No buffer clear: the compute epilogue writes degenerate index triples for every unused slot.
+- The generated vertex shader declares every parameter location the pixel shader reads and
+  feeds zero for parameters the guest program never exports; the native mesh path leaves those
+  undefined, which Vulkan validation flags.
+- Slicing is by instance only. A draw whose single instance exceeds the 64 MiB buffer is still
+  skipped with a log line.
+
+Next steps, in order of value:
+
+1. Group slicing (base-group push constant in the mesh prolog, as upstream PR #793) for draws
+   with very many points and one instance.
+2. Compaction (approach C2) only if a title shows draws whose fixed-slot triangle count
+   matters; it did not in ASTRO BOT.
+3. A force-fallback option for testing against the native path on a mesh-capable GPU.

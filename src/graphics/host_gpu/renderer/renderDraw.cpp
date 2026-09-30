@@ -1161,13 +1161,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto address     = output.BufferDeviceAddress();
 		const auto indices     = address + mesh_slice_vertex_bytes;
 		const auto index_bytes = static_cast<uint64_t>(mesh_groups) * instances * mesh_slot_index_bytes;
-		// Culled and unallocated primitives stay the degenerate triangle (0, 0, 0), which can
-		// only reach the first vertex record.
-		const auto record_bytes = state.vertex_info[0].stage.program->info.outputs.size() *
-		                          ShaderMeshInputInfo::ComputeOutputDwords * sizeof(uint32_t);
-		output.Fill(0, record_bytes, 0);
-		output.Fill(mesh_slice_vertex_bytes, index_bytes, 0);
 		buffer.EndRendering();
+		// The shader writes every slot, so the buffer only has to be free of earlier reads.
+		vk::BufferMemoryBarrier reuse {};
+		reuse.srcAccessMask =
+		    vk::AccessFlagBits::eVertexAttributeRead | vk::AccessFlagBits::eIndexRead;
+		reuse.dstAccessMask       = vk::AccessFlagBits::eShaderWrite;
+		reuse.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		reuse.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		reuse.buffer              = output.Handle();
+		reuse.offset              = 0;
+		reuse.size                = mesh_slice_vertex_bytes + index_bytes;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eVertexInput,
+		                          vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags {},
+		                          0, nullptr, 1, &reuse, 0, nullptr);
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *mesh_pipeline, stages.first(1));
 		const uint32_t draw_data[] {
 		    draw.index_count,

@@ -444,3 +444,51 @@ three programs draw (particle-like effects).
 - The "error" blocks in the test log come from the suite's expected-failure cases, which run
   in forked children.
 - Not verified yet: execution on the GPU. That needs stage 2.
+
+## 2026-09-30 (early) — Phase B, stage 2: renderer
+
+### What was built
+
+| Piece | Where |
+| --- | --- |
+| Device flag `mesh_shader_compute_fallback` (true only without mesh shaders) plus a startup log line | `graphicContext.h`, `vulkanWindow.cpp` |
+| `GetGraphicsPrograms`: sets `via_compute`, checks compute limits (invocations, shared memory) instead of mesh limits, logs each program once as `Mesh fallback compute` or `Mesh fallback skipped` | `pipelineCache.cpp` |
+| `GetMeshComputePipeline`: compute pipeline for the mesh program, cached by program id next to the real compute pipelines | `pipelineCache.cpp/.h`, `shaders.cpp` (compute pipeline creation now takes a `ShaderStageRuntime`) |
+| Graphics pipeline: generated vertex shader + guest pixel shader, one vertex binding of vec4 records, triangle list, push constants for the fragment stage only | `shaders.cpp`, `pipelineCache.cpp` |
+| Generated vertex shader (`BuildMeshOutputVertexShader`): attribute N = output N; Position, Parameter locations and Layer replayed; parameter locations follow the pixel shader, unexported ones read as zero | new `src/graphics/shader/meshOutputShader.{h,cpp}` |
+| Output buffer: 64 MiB device-local buffer with device address, created on first use | `bufferCache.{h,cpp}` `GetMeshOutputBuffer` |
+| Draw path: end rendering, clear the first record and the index region, commit the mesh program's descriptors on the compute point, push 11 dwords, dispatch `(groups, instances, 1)`, barrier to vertex input, bind the buffer as vertex + index buffer, then the usual graphics commit and `drawIndexed` | `renderDraw.cpp` |
+| `CommitBindings`: a mesh program bound on the compute point is treated as a compute stage | `descriptors.cpp` |
+| Unit test for the generated vertex shader | `tests/shaderCfgTests.cpp` |
+
+Draws that would not fit the buffer or the compute workgroup limits are skipped with a log line
+(`Mesh fallback: skipped oversized`). None occurred in ASTRO BOT's intro.
+
+### Verification
+
+1. **Readback (temporary diagnostic, removed before commit).** After each dispatch the output
+   buffer was copied to host memory and analysed:
+   - program `0xc739...` (points to quads, 20 points per group): a particle system whose real
+     triangle count grew 42 → 88 across frames and spilled from group 0 into groups 1 and 2,
+     with plausible clip-space positions (w ≈ 450–700). Groups beyond the first therefore work.
+   - program `0x4e55...`: only "dummy" allocations in the intro (one vertex, one null
+     primitive per group, which is what NGG hardware requires when nothing is emitted).
+   - no out-of-range indices in any traced draw.
+2. **Opaque test (temporary diagnostic, removed).** With blending and culling forced off for
+   fallback draws, the geometry showed on screen as solid quads where the particles are.
+3. **Vulkan validation**, run inside the distrobox (`vulkan-validation-layers` installed
+   there; the host has none): the first error was a push-constant stage mismatch in the
+   fallback's graphics pipeline layout — fixed. The second was a vertex/fragment interface
+   mismatch — turned out to be pre-existing (reproduced with the stage 0 build). With
+   validation made non-fatal for one run, all three fallback programs created their pipelines
+   and drew for 150 s without any error attributed to them; the remaining errors are the
+   stock emulator's (interface mismatches on regular pipelines, sampled-image format issues).
+4. `shader_cfg_tests`: exit code 0.
+5. Normal run `run-s2-final`, 125 s, no abort. Frame rate 13–15 fps (stage 0: 16–19 fps).
+   Screenshots `..\diag\run-s2-final\shot-*.png`.
+
+### Known limits after stage 2
+
+- No slicing: a draw whose output exceeds 64 MiB or 65535 instances is skipped.
+- Fixed slots: every group submits `max_primitives` triangles; unused ones are degenerate.
+- Two buffer fills and one render pass break per GS draw.

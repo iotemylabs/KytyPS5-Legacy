@@ -944,6 +944,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
+	// Legacy: a mesh program bound to the compute point was compiled as a compute shader.
+	const auto native_stage = [&](const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+		return pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
+		               program.stage == ShaderType::Mesh
+		           ? vk::ShaderStageFlagBits::eCompute
+		           : NativeShaderStage(program.stage);
+	};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
@@ -951,7 +958,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (const auto& binding: program.bindings.descriptors) {
 			descriptor_count += NativeDescriptorCount(binding);
 		}
-		const auto shader_stage = NativeShaderStage(program.stage);
+		const auto shader_stage = native_stage(program);
 		push_stages |= shader_stage;
 		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
@@ -968,7 +975,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
-		const auto  shader_stage  = NativeShaderStage(program.stage);
+		const auto  shader_stage  = native_stage(program);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();

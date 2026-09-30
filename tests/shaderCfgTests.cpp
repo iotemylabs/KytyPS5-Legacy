@@ -24,6 +24,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/meshOutputShader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
@@ -9687,6 +9688,30 @@ void TestMeshExportStorage() {
   mesh.via_compute = false;
 }
 
+// Legacy: the vertex shader that draws the records of a compute-encoded mesh program.
+void TestMeshOutputVertexShader() {
+  using ShaderRecompiler::IR::StageOutputKind;
+  ShaderRecompiler::IR::CompiledShaderInfo program{};
+  program.stage = ShaderType::Mesh;
+  program.info.outputs = {
+      {StageOutputKind::Position, 0, 0, "gl_Position"},
+      {StageOutputKind::Parameter, 0, 0, "out_param_0"},
+      {StageOutputKind::Parameter, 3, 3, "out_param_3"},
+      {StageOutputKind::Layer, 0, 0, "gl_Layer"},
+  };
+  const auto spirv = BuildMeshOutputVertexShader(program, nullptr);
+  CheckSpirvBinaryValidates(spirv);
+  const auto source = DisassembleSpirvBinary(spirv);
+  Check(source.find("OpEntryPoint Vertex") != std::string::npos,
+        "mesh output shader is not a vertex shader");
+  for (const char *text : {"Location 0", "Location 1", "Location 2", "Location 3",
+                           "BuiltIn Position", "BuiltIn Layer"}) {
+    Check(source.find(text) != std::string::npos, "mesh output shader lost an interface");
+  }
+  Check(source.find("Location 4") == std::string::npos,
+        "mesh output shader declares a location it has no attribute for");
+}
+
 void TestMergedShaderUserDataSnapshot() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -13693,6 +13718,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshOutputVertexShader();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

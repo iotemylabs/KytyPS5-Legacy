@@ -581,6 +581,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	graphics.mesh_shader_compute_fallback = !graphics.mesh_shader_enabled;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -618,6 +619,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	if (graphics.mesh_shader_compute_fallback) {
+		LOGF("Vulkan mesh shader fallback active: merged GS programs run as compute shaders\n");
+	}
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,

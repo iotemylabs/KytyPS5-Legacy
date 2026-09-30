@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/meshOutputShader.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
@@ -224,7 +225,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                        rendering.stencil_format != vk::Format::eUndefined;
 	EXIT_IF(!vs_input_info.stage);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
-	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
+	// Legacy: the mesh program runs in its own compute pipeline; this pipeline draws its output.
+	const bool mesh_via_compute = mesh && vs_input_info.mesh.via_compute;
+	EXIT_NOT_IMPLEMENTED(mesh && !mesh_via_compute && !graphics.mesh_shader_enabled);
 	const bool rect_list =
 	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
 
@@ -250,9 +253,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
+	vk::ShaderModule mesh_output_shader_module = nullptr;
+	if (mesh_via_compute) {
+		mesh_output_shader_module = CompileSPV(
+		    BuildMeshOutputVertexShader(*vs_input_info.stage.program,
+		                                ps_active ? ps_input_info : nullptr),
+		    graphics.device);
+		EXIT_NOT_IMPLEMENTED(mesh_output_shader_module == nullptr);
+	}
+
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
-	for (uint32_t i = 0; i < vertex_info.size(); i++) {
+	if (mesh_via_compute) {
+		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eVertex,
+		                                       .module = mesh_output_shader_module,
+		                                       .pName  = "main"};
+	}
+	for (uint32_t i = 0; !mesh_via_compute && i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           NativeShaderStage(vertex_info[i].logical_stage),
 		                                       .module = programs.vertex[i].module,
@@ -288,6 +305,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		input_attr[index].binding  = vertex_input.attributes[index].binding;
 		input_attr[index].location = index;
 		input_attr[index].offset   = vertex_input.attributes[index].offset;
+		if (mesh_via_compute) {
+			const auto kind = vs_input_info.stage.program->info.outputs[index].kind;
+			input_attr[index].format = kind == ShaderRecompiler::IR::StageOutputKind::Layer
+			                               ? vk::Format::eR32Uint
+			                               : vk::Format::eR32G32B32A32Sfloat;
+			continue;
+		}
 
 		uint32_t   attr_size     = 4;
 		const auto registers_num = vs_input_info.resources_dst[index].registers_num;
@@ -436,6 +460,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
 	for (const auto& stage: vertex_info) {
+		if (mesh_via_compute) {
+			// The generated vertex shader has no descriptors and reads no push constants.
+			break;
+		}
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
@@ -519,8 +547,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
-	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
-	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
+	const bool native_mesh                 = mesh && !mesh_via_compute;
+	pipeline_info.pVertexInputState        = native_mesh ? nullptr : &vertex_input_info;
+	pipeline_info.pInputAssemblyState      = native_mesh ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints =
 	    tessellation ? vs_input_info.tess.input_control_points : 3u;
@@ -561,12 +590,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+	if (mesh_output_shader_module != nullptr) {
+		graphics.device.destroyShaderModule(mesh_output_shader_module, nullptr);
+	}
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+	CreatePipelineInternal(graphics, pipeline, input_info.stage, compute_module, driver_cache);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderStageRuntime& stage, vk::ShaderModule compute_module,
+                            vk::PipelineCache driver_cache) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -574,8 +613,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
-	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
+	EXIT_IF(!stage);
+	const auto wave_size = stage.program->wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
@@ -583,8 +622,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
-	                  vk::ShaderStageFlagBits::eCompute);
+	AddLayoutBindings(descriptor_bindings, *stage.program, vk::ShaderStageFlagBits::eCompute);
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};

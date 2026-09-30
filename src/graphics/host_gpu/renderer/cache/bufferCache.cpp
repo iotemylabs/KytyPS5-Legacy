@@ -208,6 +208,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
 
+Buffer& BufferCache::GetMeshOutputBuffer() {
+	if (!m_mesh_output_buffer) {
+		m_mesh_output_buffer = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, MeshOutputBufferSize);
+		SetVulkanObjectNameF(m_graphics.device, m_mesh_output_buffer->Handle(),
+		                     "Kyty.MeshOutputBuffer");
+	}
+	return *m_mesh_output_buffer;
+}
+
 BufferCache::~BufferCache() {
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");

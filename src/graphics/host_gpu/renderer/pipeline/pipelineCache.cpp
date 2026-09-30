@@ -593,26 +593,46 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active && !m_graphics.mesh_shader_enabled) {
-		// Legacy: without VK_EXT_mesh_shader the merged GS draw is dropped, not fatal.
+		// Legacy: without VK_EXT_mesh_shader the merged GS program runs as a compute shader.
+		auto& mesh              = vertex_info[0].mesh;
+		mesh.via_compute        = m_graphics.mesh_shader_compute_fallback;
+		mesh.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+		const auto& limits      = m_graphics.GetPhysicalDeviceProperties().limits;
+		const auto  logical_threads =
+		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+		// Guest LDS, the shared Layer staging and the allocation pair.
+		const auto shared_bytes =
+		    (static_cast<uint64_t>(mesh.lds_size_dwords) + mesh.max_vertices + 2u) *
+		    sizeof(uint32_t);
+		const bool supported = mesh.via_compute &&
+		                       host_threads <= limits.maxComputeWorkGroupInvocations &&
+		                       host_threads <= limits.maxComputeWorkGroupSize[0] &&
+		                       shared_bytes <= limits.maxComputeSharedMemorySize;
 		static std::mutex                   logged_mutex;
 		static std::unordered_set<uint64_t> logged;
-		const std::lock_guard               lock(logged_mutex);
-		if (logged.insert(vertex_params[0].hash).second) {
-			const auto& info = vertex_info[0].mesh;
-			PipelineCacheLog("Mesh fallback needed: hash=0x{:016x} fused={} code_words={}+{} "
-			                 "input_primitive={} wave={} threads={} max_vertices={} "
-			                 "max_primitives={} primitives_per_group={} vertices_per_group={} "
-			                 "lds_dwords={} scratch_dwords={} provoking={}",
-			                 vertex_params[0].hash, !vertex_params[0].back_code.empty(),
-			                 vertex_params[0].code.size(), vertex_params[0].back_code.size(),
-			                 info.input_primitive, info.wave_size, info.threads_num[0],
-			                 info.max_vertices, info.max_primitives, info.primitives_per_group,
-			                 info.vertices_per_group, info.lds_size_dwords,
-			                 info.scratch_size_dwords, info.provoking_vertex);
+		{
+			const std::lock_guard lock(logged_mutex);
+			if (logged.insert(vertex_params[0].hash).second) {
+				PipelineCacheLog("Mesh fallback {}: hash=0x{:016x} fused={} code_words={}+{} "
+				                 "input_primitive={} wave={} threads={} max_vertices={} "
+				                 "max_primitives={} primitives_per_group={} "
+				                 "vertices_per_group={} lds_dwords={} scratch_dwords={} "
+				                 "provoking={}",
+				                 supported ? "compute" : "skipped", vertex_params[0].hash,
+				                 !vertex_params[0].back_code.empty(), vertex_params[0].code.size(),
+				                 vertex_params[0].back_code.size(), mesh.input_primitive,
+				                 mesh.wave_size, mesh.threads_num[0], mesh.max_vertices,
+				                 mesh.max_primitives, mesh.primitives_per_group,
+				                 mesh.vertices_per_group, mesh.lds_size_dwords,
+				                 mesh.scratch_size_dwords, mesh.provoking_vertex);
+			}
 		}
-		return {};
-	}
-	if (mesh_active) {
+		if (!supported) {
+			return {};
+		}
+	} else if (mesh_active) {
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
@@ -663,8 +683,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.enabled = true;
 	}
 	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	uint32_t push_data_cursor = 0;
+	if (mesh_active) {
+		push_data_cursor = vertex_info[0].mesh.via_compute
+		                       ? ShaderRecompiler::IR::PushData::MeshComputeDrawDwordCount
+		                       : ShaderRecompiler::IR::PushData::MeshDrawDwordCount;
+	}
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
@@ -802,7 +826,21 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 
-	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+	if (vs_input_info.stage.program->stage == ShaderType::Mesh) {
+		if (vs_input_info.mesh.via_compute) {
+			// Legacy: one binding holding the records written by the compute encoding.
+			const auto outputs = vs_input_info.stage.program->info.outputs.size();
+			EXIT_IF(outputs > ShaderVertexInputInfo::RES_MAX);
+			const auto stride = ShaderMeshInputInfo::ComputeOutputDwords * sizeof(uint32_t);
+			key.vertex_input.binding_count   = 1;
+			key.vertex_input.attribute_count = static_cast<uint8_t>(outputs);
+			key.vertex_input.bindings[0] = {.stride = static_cast<uint32_t>(outputs * stride)};
+			for (uint32_t index = 0; index < outputs; index++) {
+				key.vertex_input.attributes[index] = {
+				    .offset = static_cast<uint32_t>(index * stride)};
+			}
+		}
+	} else {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
 		        vs_input_info.resources_num < 0 ||
@@ -853,6 +891,33 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	EXIT_IF(!inserted);
+
+	return *iter->second;
+}
+
+PipelineCache::Pipeline&
+PipelineCache::GetMeshComputePipeline(const ShaderVertexInputInfo& input_info,
+                                      const ShaderProgram&         mesh_program) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(MeshCompute)", profiler::colors::RedA100);
+
+	EXIT_IF(!mesh_program || !input_info.mesh.via_compute);
+
+	Common::LockGuard lock(m_mutex);
+
+	if (auto iter = m_compute_pipelines.find(mesh_program.id);
+	    iter != m_compute_pipelines.end()) {
+		return *iter->second;
+	}
+
+	auto cached = std::make_unique<Pipeline>();
+	CreatePipelineInternal(m_graphics, *cached, input_info.stage, mesh_program.module,
+	                       m_driver_cache);
+
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+
+	auto [iter, inserted] = m_compute_pipelines.emplace(mesh_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
 	return *iter->second;
